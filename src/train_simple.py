@@ -8,7 +8,7 @@ import os
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 import argparse
 from pathlib import Path
 
