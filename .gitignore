@@ -50,6 +50,7 @@ checkpoints/
 data/
 datasets/
 raw_data/
+cache/
 
 # Logs and outputs
 logs/
@@ -57,6 +58,7 @@ logs/
 tensorboard/
 runs/
 wandb/
+*.pt
 
 # IDE
 .vscode/
