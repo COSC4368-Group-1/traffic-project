@@ -1,6 +1,6 @@
 <!-- filepath: c:\Users\Ricardo Trevizo\Documents\Code\COSC4368\traffic-project\README_CNN_GNN.md -->
 
-# CNN-GNN Traffic Prediction Model - Setup Complete! 🎉
+# MLP-GNN Traffic Prediction Model 🎉
 
 ## 📋 Table of Contents
 
@@ -17,13 +17,58 @@
 
 ### High-Level Overview
 
-This project combines **Convolutional Neural Networks (CNN)** and **Graph Neural Networks (GNN)** to predict traffic congestion in urban road networks.
+This project combines **Multi-Layer Perceptrons (MLP)** and **Graph Neural Networks (GNN)** to predict traffic congestion in urban road networks.
 
 ```
-Traffic Image (Heatmap)  →  [CNN Feature Extraction]  ⟍
-                                                       [Fusion Layer]  →  Traffic Prediction
-Road Network Graph       →  [GNN Graph Processing]   ⟋
+Road Feature Vectors    →  [MLP Feature Processing]   ⟍
+                                                       [GNN Graph Learning]  →  Traffic Prediction
+Road Network Graph      →  [Graph Structure]          ⟋
 ```
+
+### Key Difference from CNN Approach
+
+**CNN Approach** (Previous):
+
+```
+Input: A 64×64 image (pixels arranged in 2D grid)
+┌─────────────────┐
+│ 🟥🟥🟧🟧🟨🟨🟩🟩 │  Each pixel = congestion at that location
+│ 🟥🟥🟧🟧🟨🟨🟩🟩 │  Model learns: "Red blob in top-left means traffic jam"
+│ 🟧🟧🟨🟨🟩🟩🟩🟩 │
+│ 🟧🟧🟨🟨🟩🟩🟩🟩 │  Problem: Which roads are these? How do they connect?
+└─────────────────┘  Answer: ¯\_(ツ)_/¯ (lost in rasterization!)
+
+Process:
+1. Look at local pixel neighborhoods
+2. Find spatial patterns ("traffic jam looks like this blob shape")
+3. Classify: "This image shows heavy traffic in northwest"
+
+What it learns: "Spatial patterns in images"
+```
+
+**MLP Approach** (Current):
+
+```
+Input: A feature vector per road segment
+Road ID 1: [lanes=2, width=7m, speed=8m/s, congestion=0.7, straight=0.9, ...]
+Road ID 2: [lanes=4, width=14m, speed=15m/s, congestion=0.2, straight=0.6, ...]
+Road ID 3: [lanes=1, width=3.5m, speed=5m/s, congestion=0.9, straight=0.3, ...]
+
+Process:
+1. Look at ALL features for ONE road at a time
+2. Find feature combinations: "2 lanes + high congestion + slow speed = BAD"
+3. Classify: "This specific road is in heavy traffic state"
+
+What it learns: "Feature patterns in structured data"
+```
+
+**Why This Change?**
+
+- ✅ **More Data**: 200,000+ edges with 10+ features each (vs. 5 images)
+- ✅ **Better Features**: Road geometry, connectivity, and traffic metrics directly available
+- ✅ **Same Training Time**: Process structured data as fast as images
+- ✅ **Explicit Connections**: Road network structure preserved (not lost in rasterization)
+- ✅ **Easier to Build**: Direct feature engineering instead of image processing
 
 ### 1. **Data Collection & Preparation**
 
@@ -35,63 +80,81 @@ Road Network Graph       →  [GNN Graph Processing]   ⟋
 
 **Outputs**:
 
-- **Traffic Heatmaps**: Visual representation of traffic density (images)
-- **Road Network Graph**: Nodes (intersections) and edges (roads) with traffic attributes
+- **Road Network Graph**: 200,000+ edges with rich features
+  - Nodes (intersections) and edges (roads) with traffic attributes
+  - **10+ Features per Edge**: speed, density, occupancy, lanes, width, geometry, bridge/tunnel flags, etc.
 - **Traffic Attributes**: Speed, density, occupancy, congestion level per road
 
-### 2. **CNN Path: Image Feature Extraction**
+### 2. **MLP Path: Feature Processing**
 
-The CNN processes traffic heatmap images:
+The MLP processes individual road segment features:
 
 ```
-Input Image (224×224)
+Input: Road Feature Vector (10+ dimensions)
+    • lanes (int)
+    • width (meters)
+    • speed (m/s)
+    • maxspeed (km/h)
+    • congestion (0-1)
+    • bridge (0/1)
+    • tunnel (0/1)
+    • geometry metrics (straightness, length, etc.)
     ↓
-ResNet18 Backbone (pre-trained)
-    • Conv layers extract spatial patterns
-    • Detects traffic congestion hotspots
-    • Identifies traffic flow patterns
+Dense Layer 1: 10+ → 64 dimensions
+    • ReLU Activation
+    • Learns feature combinations
+    • "2 lanes + narrow + slow = residential street"
     ↓
-Feature Maps (256-dimensional)
-    • Compact representation of traffic scene
-    • Preserves spatial information
+Dense Layer 2: 64 → 128 dimensions
+    • ReLU Activation
+    • Higher-level feature patterns
+    • "High congestion + multiple lanes = highway jam"
     ↓
-Global Average Pooling
-    • Converts spatial features to vector
-    • Output: 256-dim feature vector
+Dense Layer 3: 128 → 256 dimensions
+    • ReLU Activation
+    • Complex feature interactions
+    ↓
+Output: 256-dim feature vector per road
+    • Compact representation of road state
+    • Ready for graph processing
 ```
 
-**What CNN learns**:
+**What MLP learns**:
 
-- Where congestion occurs (spatial patterns)
-- Traffic density distribution
-- Road network structure from visual data
+- Feature combinations that indicate congestion
+- Road type classification from attributes
+- Traffic state patterns per road segment
+- Non-linear relationships between features
 
 ### 3. **GNN Path: Network Topology Processing**
 
-The GNN processes the road network graph:
+The GNN processes the road network graph with MLP-enhanced features:
 
 ```
 Road Network Graph
-    • Nodes: Intersections (269,151 nodes)
-    • Edges: Roads (300,972 edges)
-    • Node features: lanes, speed limit, bridge/tunnel flags
+    • Nodes: Road segments (200,000+ edges as nodes)
+    • Edges: Road connections from OSM
+    • Node features: 256-dim vectors from MLP
     ↓
 Graph Convolutional Network (GCN)
-    Layer 1: 8-dim → 128-dim
+    Layer 1: 256-dim → 128-dim
     • Each node aggregates info from neighboring roads
-    • Message passing: "What's happening on connected roads?"
+    • Message passing: "What's traffic like on connected roads?"
+    • MLP features + network structure
 
     Layer 2: 128-dim → 256-dim
     • Second-order information
     • Multi-hop traffic patterns
+    • "Traffic 2 roads away affects me"
     ↓
 Attention-Based Aggregation
     • Learns which neighbors are important
     • Dynamic weighting of road connections
+    • "Highway entrance more important than side street"
     ↓
 Graph Embedding (256-dim)
-    • Compressed representation of traffic network structure
-    • Encodes road connectivity patterns
+    • Network-aware road representation
+    • Combines individual features + connectivity
 ```
 
 **What GNN learns**:
@@ -99,24 +162,14 @@ Graph Embedding (256-dim)
 - How roads are connected
 - Which intersections influence each other
 - Traffic flow propagation through network
+- Contextual road importance
 
-### 4. **Fusion & Prediction**
+### 4. **Prediction Output**
 
-Combines CNN and GNN outputs:
+Final prediction from GNN embeddings:
 
 ```
-CNN Features (256-dim)  ⟍
-                        [Concatenate]  →  512-dim vector
-GNN Features (256-dim)  ⟋
-                        ↓
-Fully Connected Layer
-                        ↓
-ReLU Activation
-                        ↓
-Output Layer
-                        ↓
-Prediction (1-dim)
-    • Traffic congestion level (0-1)
+GNN Output: Traffic congestion level (0-1)
     • OR: Average traffic speed
     • OR: Overall network occupancy
 ```
@@ -127,35 +180,22 @@ Prediction (1-dim)
 
 ✅ **Data Generation**: Complete
 
-- 5 traffic heatmap images from SUMO simulation
-- 300,972 edges with traffic attributes
-- 269,151 nodes in network graph
+- 200,000+ road segments with traffic attributes
+- 10+ features per edge: lanes, width, speed, geometry, etc.
+- Network graph structure preserved from OSM
 
-✅ **Data Validation**: Passed
+✅ **Architecture Design**: MLP → GNN Pipeline
 
-- Images: RGBA (224x224) format
-- Edge features: speed, density, occupancy, lanes, bridges, tunnels
-- Graph: 300,972 nodes with 1.5M spatial edges
+- MLP: 3-layer feature processor (10+ → 64 → 128 → 256)
+- GNN: 2-layer GCN with attention aggregation
+- Direct feature engineering (no image processing needed)
 
-✅ **Model Architecture**: Ready
+🔄 **Implementation**: In Progress
 
-- CNN: ResNet18 feature extractor (256-dim features)
-- GNN: 2-layer GCN with attention aggregation (256-dim embedding)
-- Fusion: Combined CNN+GNN features → prediction layer
-- Total parameters: 11.7M
-
-✅ **Data Loading**: Functional
-
-- Custom collate function for CNN-GNN batches
-- Handles 300K-node graphs efficiently
-- Spatial graph connectivity from k-NN (k=5)
-
-✅ **Training**: In Progress
-
-- Running `train_simple.py`
-- 50 epochs, batch_size=1, learning_rate=0.001
-- Using MSE loss with average congestion as target
-- Checkpoints saved: model_best.pt, model_final.pt
+- Data loader for edge features + graph structure
+- MLP feature encoder
+- GNN integration with MLP outputs
+- Training pipeline setup
 
 ---
 
