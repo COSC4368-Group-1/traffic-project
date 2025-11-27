@@ -11,6 +11,32 @@ import numpy as np
 from rtree import index
 from pathlib import Path
 from shapely.geometry import box
+import time
+
+
+def generate_trips(sumo_tools_path, net_file, trips_file, density=3, seed=42):
+    """
+    Calls SUMO's randomTrips.py to generate trips for a network.
+    """
+    random_trips = os.path.join(sumo_tools_path, "randomTrips.py")
+    
+    cmd = [
+        sys.executable, random_trips,
+        "-n", net_file,
+        "-o", trips_file,
+        "--fringe-factor", str(density),
+        "--seed", str(seed),
+        "--trip-attributes", 'departLane="best" departSpeed="max"'
+    ]
+    
+    try:
+        print(f"Generating trips: {trips_file}...")
+        subprocess.run(cmd, check=True, stdout=sys.stdout, stderr=sys.stderr, timeout=600)
+        print("✓ Trips generated successfully")
+    except subprocess.TimeoutExpired:
+        print("✗ Traffic generation timed out!")
+    except subprocess.CalledProcessError as e:
+        print(f"✗ SUMO script failed: {e}")
 
 # -----------------------------
 # Config - ENABLED ALL CITIES FOR SUMO
@@ -25,8 +51,17 @@ output_dir = "raw_data"
 os.makedirs(output_dir, exist_ok=True)
 
 # SUMO configuration
-SIMULATION_TIME = 600  # 10 minutes for testing
-NUM_TRAFFIC_SNAPSHOTS = 10
+SIMULATION_TIME = 2400  # 40 minutes for testing
+NUM_TRAFFIC_SNAPSHOTS = 40  # Number of traffic data snapshots to extract
+NUM_SIMULATION_RUNS = 5  # Number of simulation runs per city
+
+EMERGENCY_VEHICLE_PREFERENCES ={
+    'min_lanes' : 2,
+    'min_width' : 6.0,  # meters
+    'prefer_straight' : True,
+    'avoid_congestion' : True,
+    'prefer_arterials' : True
+}
 
 # -----------------------------
 # IMPROVED Utility Functions
@@ -118,6 +153,109 @@ def parse_lanes(lanes_raw):
             return int(lanes_raw)
         except (ValueError, TypeError):
             return 1
+
+def calculate_road_straightness(geometry):
+    """
+    Calculate how straight a road is (0 = very curvy, 1 = perfectly straight)
+    """
+    if geometry.geom_type != 'LineString':
+        return 0.5
+    
+    coords = list(geometry.coords)
+    if len(coords) < 2:
+        return 0.5
+    
+    # Calculate actual length vs straight-line distance
+    actual_length = geometry.length
+    straight_distance = ((coords[-1][0] - coords[0][0])**2 + 
+                        (coords[-1][1] - coords[0][1])**2)**0.5
+    
+    if actual_length == 0:
+        return 0.5
+    
+    # Straightness ratio
+    straightness = straight_distance / actual_length
+    return min(1.0, straightness)
+
+def calculate_emergency_vehicle_score(edge_row):
+    """
+    Calculate a score for how suitable a road is for emergency vehicles
+    Higher score = better for emergency vehicles
+    
+    Factors:
+    - Number of lanes (more is better)
+    - Road width (wider is better)
+    - Straightness (straighter is better)
+    - Road type (arterial > residential)
+    - Not restricted access
+    
+    Returns:
+        score: float between 0 and 1
+    """
+    score = 0.0
+    
+    # Lane score (0-0.25)
+    lanes = edge_row.get('lanes', 1)
+    lane_score = min(lanes / 4.0, 1.0) * 0.25
+    score += lane_score
+    
+    # Width score (0-0.25)
+    width = edge_row.get('width', 3.5)
+    width_score = min(width / 14.0, 1.0) * 0.25  # 14m = 4 lane road
+    score += width_score
+    
+    # Straightness score (0-0.2)
+    if 'geometry' in edge_row.index:
+        straightness = calculate_road_straightness(edge_row['geometry'])
+        score += straightness * 0.2
+    
+    # Road type score (0-0.2)
+    highway = str(edge_row.get('highway', 'residential')).lower()
+    highway_scores = {
+        'motorway': 1.0,
+        'trunk': 0.9,
+        'primary': 0.8,
+        'secondary': 0.6,
+        'tertiary': 0.5,
+        'residential': 0.3,
+        'living_street': 0.1,
+        'service': 0.2
+    }
+    highway_score = highway_scores.get(highway, 0.4) * 0.2
+    score += highway_score
+    
+    # Access restriction penalty (0-0.1)
+    is_restricted = edge_row.get('is_restricted', 0)
+    if not is_restricted:
+        score += 0.1
+    
+    return score
+
+def augment_edges_with_emergency_features(edges_gdf):
+    """
+    Add emergency vehicle relevant features to edges
+    """
+    print("Calculating emergency vehicle suitability scores...")
+    
+    # Calculate straightness for all edges
+    edges_gdf['straightness'] = edges_gdf['geometry'].apply(calculate_road_straightness)
+    
+    # Calculate emergency vehicle score
+    edges_gdf['emergency_score'] = edges_gdf.apply(
+        calculate_emergency_vehicle_score, axis=1
+    )
+    
+    # Calculate estimated travel time (for emergency vehicle at high speed)
+    # Emergency vehicles can go faster, assume 1.3x normal maxspeed
+    edges_gdf['emergency_travel_time'] = (
+        edges_gdf['length'] / (edges_gdf['maxspeed'] * 1.3)
+    )
+    
+    print(f"Emergency scores: min={edges_gdf['emergency_score'].min():.3f}, "
+          f"max={edges_gdf['emergency_score'].max():.3f}, "
+          f"mean={edges_gdf['emergency_score'].mean():.3f}")
+    
+    return edges_gdf
 
 # -----------------------------
 # IMPROVED OSM Graph Functions
@@ -340,78 +478,112 @@ def convert_to_sumo_network(osm_file, city_dir):
         print(f"✗ netconvert timed out after 5 minutes")
         return None
 
-def generate_traffic_demand(sumo_net, city_dir):
-    """Generate random traffic demand using SUMO's randomTrips"""
-    trips_file = os.path.join(city_dir, "trips.trips.xml")
-    routes_file = os.path.join(city_dir, "routes.rou.xml")
+def generate_traffic_demand_multiple_runs(sumo_net, city_dir, run_number=1):
+    """
+    Generate traffic demand with BETTER timeout handling and SIMPLIFIED parameters
+    """
+    trips_file = os.path.join(city_dir, f"trips_run{run_number}.trips.xml")
+    routes_file = os.path.join(city_dir, f"routes_run{run_number}.rou.xml")
     
     if os.path.exists(routes_file):
-        print(f"Routes already exist: {routes_file}")
+        print(f"Routes for run {run_number} already exist: {routes_file}")
         return routes_file
     
-    print("Generating random traffic demand...")
+    print(f"Generating traffic demand for run {run_number}...")
     
-    # Find randomTrips.py
     sumo_tools = get_sumo_tools_path()
     if not sumo_tools:
-        print("✗ Could not find SUMO tools directory.")
         return None
     
     random_trips = os.path.join(sumo_tools, 'randomTrips.py')
-    
     if not os.path.exists(random_trips):
         print(f"✗ randomTrips.py not found at {random_trips}")
         return None
     
-    # Generate trips with absolute paths
+    # SIMPLIFIED traffic densities for large networks
+    fringe_factors = [1, 2, 3]  # Much lower densities to avoid freezing
+    fringe_factor = fringe_factors[(run_number - 1) % len(fringe_factors)]
+    
+    # Different seed for each run
+    seed = 42 + run_number * 100
+    
+    print(f"  Traffic density: {fringe_factor}, Seed: {seed}")
+    
+    # CRITICAL FIX: Use SIMPLIFIED command with timeout and progress
     cmd = [
         sys.executable,
         random_trips,
         '-n', sumo_net,
         '-o', trips_file,
-        '-e', str(SIMULATION_TIME),
-        '--fringe-factor', '5',
-        '--min-distance', '300',
-        '--trip-attributes', 'departLane="best" departSpeed="max"',
-        '--validate'
+        '-e', str(SIMULATION_TIME),  # Only generate trips for first 100 seconds (TEST MODE)
+        '--fringe-factor', str(fringe_factor),
+        '--min-distance', '1000',  # Increased minimum distance
+        '--seed', str(seed),
+        '--verbose'
+        # REMOVED: --validate (causes issues with large networks)
+        # REMOVED: --trip-attributes (simplify)
     ]
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-        print(f"✓ Generated trips: {trips_file}")
-    except subprocess.CalledProcessError as e:
-        print(f"✗ randomTrips failed with return code {e.returncode}")
-        print(f"Error output: {e.stderr[:500]}...")
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"✗ randomTrips timed out after 5 minutes")
+        print(f"  Starting trip generation (timeout: 1200s)...")
+        print(f"  Command: {' '.join(cmd)}")
+        
+        # Use Popen for better control
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        # Read output with timeout
+        try:
+            stdout, stderr = process.communicate(timeout=1200)  # 20 minute timeout
+            
+            if process.returncode == 0:
+                print(f"✓ Generated trips for run {run_number}")
+                print(f"  Output: {stdout.strip()}")
+            else:
+                print(f"✗ Trip generation failed with code {process.returncode}")
+                print(f"  Error: {stderr.strip()}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            print(f"✗ Trip generation TIMED OUT after 5 minutes")
+            process.kill()
+            return None
+            
+    except Exception as e:
+        print(f"✗ Failed to generate trips: {e}")
         return None
     
-    # Convert trips to routes using duarouter
-    print("Computing routes from trips...")
+    # Now generate routes with duarouter
+    print(f"  Generating routes from trips...")
     cmd = [
         'duarouter',
         '-n', sumo_net,
         '-t', trips_file,
         '-o', routes_file,
         '--ignore-errors',
-        '--repair'
+        '--repair',
+        '--verbose'
     ]
     
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-        print(f"✓ Generated routes: {routes_file}")
+        print(f"✓ Generated routes for run {run_number}")
         return routes_file
-    except subprocess.CalledProcessError as e:
-        print(f"✗ duarouter failed with return code {e.returncode}")
-        print(f"Error output: {e.stderr[:500]}...")
-        return None
     except subprocess.TimeoutExpired:
         print(f"✗ duarouter timed out after 5 minutes")
         return None
+    except subprocess.CalledProcessError as e:
+        print(f"✗ duarouter failed: {e}")
+        print(f"  Error: {e.stderr[:500]}...")
+        return None
 
 def add_emergency_vehicles(routes_file, city_dir):
-    """Add emergency vehicles to the route file"""
+    """Add emergency vehicles to the route file - OVERWRITE original"""
     if not os.path.exists(routes_file):
         return routes_file
     
@@ -439,38 +611,54 @@ def add_emergency_vehicles(routes_file, city_dir):
                 vehicle = vehicles[i]
                 vehicle.set('type', 'emergency')
         
-        # Save modified routes
-        emergency_routes = os.path.join(city_dir, "routes_with_emergency.rou.xml")
-        tree.write(emergency_routes, encoding='UTF-8', xml_declaration=True)
-        print(f"✓ Added {num_emergency} emergency vehicles")
-        return emergency_routes
+        # CRITICAL FIX: Overwrite the original file
+        tree.write(routes_file, encoding='UTF-8', xml_declaration=True)
+        print(f"✓ Added {num_emergency} emergency vehicles to {os.path.basename(routes_file)}")
+        return routes_file  # Return same filename
     
     except Exception as e:
         print(f"Warning: Could not add emergency vehicles: {e}")
         return routes_file
 
-def run_sumo_simulation(sumo_net, routes_file, city_dir):
-    """Run SUMO simulation and collect data"""
-    config_file = os.path.join(city_dir, "simulation.sumocfg")
-    edgedata_file = os.path.join(city_dir, "edgedata.xml")
-    
+def run_sumo_simulation_multiple(sumo_net, routes_file, city_dir, run_number=1):
+    """
+    Run SUMO simulation - FIXED XML FORMAT for edge data output
+    """
+    sumo_exe = r"C:\Program Files (x86)\Eclipse\Sumo\bin\sumo.exe"
+    config_file = os.path.join(city_dir, f"simulation_run{run_number}.sumocfg")
+    edgedata_file = os.path.join(city_dir, f"edgedata_run{run_number}.xml")
+    additional_file = os.path.join(city_dir, f"additional_run{run_number}.xml")  # NEW
+
     if os.path.exists(edgedata_file):
-        print(f"Simulation output already exists: {edgedata_file}")
+        print(f"Simulation output for run {run_number} already exists")
         return edgedata_file
-    
-    print(f"Running SUMO simulation ({SIMULATION_TIME}s)...")
-    
-    # FIX: Use relative paths within the city directory to avoid path doubling
-    net_file_rel = os.path.basename(sumo_net)
-    routes_file_rel = os.path.basename(routes_file)
-    edgedata_file_rel = os.path.basename(edgedata_file)
-    
+
+    print(f"Running SUMO simulation {run_number}/{NUM_SIMULATION_RUNS} ({SIMULATION_TIME}s)...")
+
+    output_interval = max(1, SIMULATION_TIME // NUM_TRAFFIC_SNAPSHOTS)
+
+    # STEP 1: Create the ADDITIONAL FILE with edge data configuration
+    additional_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<additional>
+    <edgeData id="edge_data_{run_number}" freq="{output_interval}" file="edgedata_run{run_number}.xml"/>
+</additional>"""
+
+    try:
+        with open(additional_file, 'w', encoding='utf-8') as f:
+            f.write(additional_xml)
+        print(f"✓ Created additional file: {additional_file}")
+    except Exception as e:
+        print(f"✗ Failed to create additional file: {e}")
+        return None
+
+    # STEP 2: Create the MAIN CONFIG that references the additional file
     config_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
                xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
     <input>
-        <net-file value="{net_file_rel}"/>
-        <route-files value="{routes_file_rel}"/>
+        <net-file value="network.net.xml"/>
+        <route-files value="routes_run{run_number}.rou.xml"/>
+        <additional-files value="additional_run{run_number}.xml"/>
     </input>
     <time>
         <begin value="0"/>
@@ -478,34 +666,89 @@ def run_sumo_simulation(sumo_net, routes_file, city_dir):
         <step-length value="1"/>
     </time>
     <output>
-        <summary-output value="summary.xml"/>
-        <edgedata-output value="{edgedata_file_rel}"/>
+        <summary-output value="summary_run{run_number}.xml"/>
     </output>
+    <additional>
+    <vehicleData id="vehicle_data_{run_number}" freq="{output_interval}" file="vehicledata_run{run_number}.xml"/>
+    </additional>
     <processing>
         <ignore-route-errors value="true"/>
+        <time-to-teleport value="300"/>
     </processing>
 </configuration>"""
-    
-    with open(config_file, 'w', encoding='utf-8') as f:
-        f.write(config_xml)
-    
-    # Run simulation from the city directory with relative paths
-    cmd = ['sumo', '-c', 'simulation.sumocfg', '--no-warnings']
-    
+
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, 
-                              cwd=city_dir, timeout=600)
-        print(f"✓ Simulation complete: {edgedata_file}")
-        return edgedata_file
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Simulation failed with return code {e.returncode}")
-        print(f"Error output: {e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"✗ Simulation timed out after 10 minutes")
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(config_xml)
+        print(f"✓ Created config file: {config_file}")
+    except Exception as e:
+        print(f"✗ Failed to create config file: {e}")
         return None
 
+    # STEP 3: Run SUMO
+    config_filename_only = f"simulation_run{run_number}.sumocfg"
+    
+    cmd = [
+        sumo_exe,
+        "-c", config_filename_only,
+        "--no-warnings",
+        "--verbose"
+    ]
 
+    try:
+        print(f"Command: {' '.join(cmd)}")
+        print(f"Working directory: {city_dir}")
+        print(f"Edge data interval: {output_interval}s")
+        print(f"Output file: edgedata_run{run_number}.xml")
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            cwd=city_dir,
+            bufsize=1
+        )
+
+        # Track progress
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+        # Print errors
+        stderr_output = ""
+        for line in process.stderr:
+            stderr_output += line
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+        retcode = process.wait()
+        
+        if retcode != 0:
+            print(f"✗ SUMO exited with code {retcode}")
+            if "Error" in stderr_output:
+                error_lines = [line for line in stderr_output.split('\n') if 'Error' in line]
+                for error in error_lines[:5]:
+                    print(f"  SUMO Error: {error}")
+            return None
+
+        if os.path.exists(edgedata_file):
+            file_size = os.path.getsize(edgedata_file)
+            print(f"✓ Simulation {run_number} complete: {edgedata_file} ({file_size} bytes)")
+            return edgedata_file
+        else:
+            print(f"✗ Simulation finished but output file not found: {edgedata_file}")
+            print("Files created:")
+            for f in os.listdir(city_dir):
+                if f.endswith('.xml'):
+                    print(f"  {f}")
+            return None
+
+    except Exception as e:
+        print(f"✗ Simulation {run_number} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def load_sumo_geometries_fast(sumo_net_file):
     """Fast streaming parser for SUMO network file - only extracts what we need"""
@@ -788,6 +1031,225 @@ def extract_traffic_data(city_dir, edges_gdf):
     
     return edges_gdf
 
+def extract_traffic_data_multi_run(city_dir, edges_gdf):
+    """
+    OPTIMIZED: Extract and aggregate traffic data from multiple SUMO simulation runs.
+    
+    Key improvements:
+    - Streaming XML parsing to reduce memory usage
+    - Progress tracking for visibility
+    - Batch processing of intervals
+    - Early termination options
+    """
+    print("\n" + "="*70)
+    print("EXTRACTING TRAFFIC DATA (OPTIMIZED)")
+    print("="*70)
+
+    # Initialize columns
+    for col in ['traffic_speed', 'traffic_density', 'congestion', 'occupancy', 'sample_count']:
+        edges_gdf[col] = 0.0
+
+    # Load SUMO geometries once
+    sumo_net_file = os.path.join(city_dir, "network.net.xml")
+    if not os.path.exists(sumo_net_file):
+        print("⚠ SUMO network file not found")
+        return edges_gdf
+
+    print("\n[1/4] Loading SUMO network geometries...")
+    start_time = time.time()
+    sumo_edges = load_sumo_geometries_fast(sumo_net_file)
+    if not sumo_edges:
+        return edges_gdf
+    print(f"✓ Loaded {len(sumo_edges)} SUMO edges in {time.time()-start_time:.1f}s")
+
+    # Calculate coordinate transformation parameters
+    print("\n[2/4] Building coordinate transformation...")
+    all_coords = [coord for coords in sumo_edges.values() for coord in coords]
+    sumo_bounds = (
+        min(c[0] for c in all_coords), min(c[1] for c in all_coords),
+        max(c[0] for c in all_coords), max(c[1] for c in all_coords)
+    )
+    osm_bounds = edges_gdf.total_bounds
+    
+    # Pre-calculate scale factors
+    sumo_width = sumo_bounds[2] - sumo_bounds[0]
+    sumo_height = sumo_bounds[3] - sumo_bounds[1]
+    osm_width = osm_bounds[2] - osm_bounds[0]
+    osm_height = osm_bounds[3] - osm_bounds[1]
+    
+    print(f"  SUMO bounds: {sumo_bounds}")
+    print(f"  OSM bounds: {osm_bounds}")
+
+    # Build spatial index once
+    print("\n[3/4] Building spatial index...")
+    start_time = time.time()
+    osm_idx = index.Index()
+    osm_edge_lookup = {}
+    osm_midpoints = {}  # Cache midpoints
+    
+    for i, (edge_idx, row) in enumerate(edges_gdf.iterrows()):
+        if row['geometry'].geom_type == 'LineString':
+            osm_idx.insert(i, row['geometry'].bounds)
+            osm_edge_lookup[i] = edge_idx
+            
+            # Pre-calculate midpoint
+            coords = list(row['geometry'].coords)
+            if len(coords) >= 2:
+                mid_x = (coords[0][0] + coords[-1][0]) / 2
+                mid_y = (coords[0][1] + coords[-1][1]) / 2
+                osm_midpoints[edge_idx] = (mid_x, mid_y)
+    
+    print(f"✓ Built spatial index for {len(osm_edge_lookup)} edges in {time.time()-start_time:.1f}s")
+
+    # Process simulation runs
+    print("\n[4/4] Processing simulation runs...")
+    print("="*70)
+    
+    total_matched = 0
+    search_radius = 0.001
+    
+    for run_num in range(1, NUM_SIMULATION_RUNS + 1):
+        edgedata_file = os.path.join(city_dir, f"edgedata_run{run_num}.xml")
+        if not os.path.exists(edgedata_file):
+            print(f"⚠ Run {run_num}: File not found")
+            continue
+
+        file_size_mb = os.path.getsize(edgedata_file) / (1024*1024)
+        print(f"\nRun {run_num}/{NUM_SIMULATION_RUNS} ({file_size_mb:.0f}MB)")
+        print("-"*70)
+        
+        run_start = time.time()
+        matched_this_run = 0
+        processed_edges = 0
+        
+        try:
+            # Use iterative parsing to avoid loading entire file into memory
+            context = ET.iterparse(edgedata_file, events=('start', 'end'))
+            context = iter(context)
+            event, root = next(context)
+            
+            interval_count = 0
+            
+            for event, elem in context:
+                if event == 'end' and elem.tag == 'interval':
+                    interval_count += 1
+                    
+                    # Progress update every 10 intervals
+                    if interval_count % 10 == 0:
+                        elapsed = time.time() - run_start
+                        rate = processed_edges / elapsed if elapsed > 0 else 0
+                        print(f"  Interval {interval_count}: {matched_this_run:,} matched, "
+                              f"{rate:.0f} edges/s", end='\r')
+                    
+                    # Process edges in this interval
+                    for sumo_edge_elem in elem.findall('edge'):
+                        processed_edges += 1
+                        sumo_id = sumo_edge_elem.get('id')
+                        
+                        if sumo_id not in sumo_edges:
+                            continue
+                        
+                        coords = sumo_edges[sumo_id]
+                        if len(coords) < 2:
+                            continue
+
+                        # Transform SUMO coordinates to OSM (vectorized)
+                        mid_x = (coords[0][0] + coords[-1][0]) / 2
+                        mid_y = (coords[0][1] + coords[-1][1]) / 2
+                        norm_x = (mid_x - sumo_bounds[0]) / sumo_width
+                        norm_y = (mid_y - sumo_bounds[1]) / sumo_height
+                        osm_mid_x = osm_bounds[0] + norm_x * osm_width
+                        osm_mid_y = osm_bounds[1] + norm_y * osm_height
+
+                        # Spatial query
+                        nearby = list(osm_idx.intersection((
+                            osm_mid_x - search_radius, osm_mid_y - search_radius,
+                            osm_mid_x + search_radius, osm_mid_y + search_radius
+                        )))
+                        
+                        if not nearby:
+                            continue
+                        
+                        # Find best match using cached midpoints
+                        best_idx, min_dist = None, float('inf')
+                        for i in nearby:
+                            actual_edge_idx = osm_edge_lookup[i]
+                            
+                            if actual_edge_idx not in osm_midpoints:
+                                continue
+                            
+                            osm_mid_x2, osm_mid_y2 = osm_midpoints[actual_edge_idx]
+                            dist = (osm_mid_x - osm_mid_x2)**2 + (osm_mid_y - osm_mid_y2)**2
+                            
+                            if dist < min_dist and dist < search_radius**2:
+                                min_dist, best_idx = dist, actual_edge_idx
+
+                        if best_idx is not None:
+                            # Extract metrics
+                            speed = float(sumo_edge_elem.get('speed', 0) or 0)
+                            density = float(sumo_edge_elem.get('density', 0) or 0)
+                            occupancy = float(sumo_edge_elem.get('occupancy', 0) or 0)
+                            
+                            # Update running average
+                            current_count = edges_gdf.at[best_idx, 'sample_count']
+                            
+                            edges_gdf.at[best_idx, 'traffic_speed'] = (
+                                edges_gdf.at[best_idx, 'traffic_speed'] * current_count + speed
+                            ) / (current_count + 1)
+                            edges_gdf.at[best_idx, 'traffic_density'] = (
+                                edges_gdf.at[best_idx, 'traffic_density'] * current_count + density
+                            ) / (current_count + 1)
+                            edges_gdf.at[best_idx, 'occupancy'] = (
+                                edges_gdf.at[best_idx, 'occupancy'] * current_count + occupancy
+                            ) / (current_count + 1)
+                            edges_gdf.at[best_idx, 'sample_count'] = current_count + 1
+                            
+                            matched_this_run += 1
+                    
+                    # Clear element from memory
+                    elem.clear()
+                    root.clear()
+            
+            elapsed = time.time() - run_start
+            print(f"  ✓ Run {run_num}: {matched_this_run:,} matches in {elapsed:.1f}s "
+                  f"({processed_edges/elapsed:.0f} edges/s)")
+            total_matched += matched_this_run
+            
+        except Exception as e:
+            print(f"  ✗ Error parsing run {run_num}: {e}")
+            continue
+
+    # Compute final congestion values
+    print("\n" + "="*70)
+    print("Computing congestion metrics...")
+    edges_with_traffic = 0
+    for idx, row in edges_gdf.iterrows():
+        if row['sample_count'] > 0:
+            edges_gdf.at[idx, 'congestion'] = max(0.0, min(1.0, 1.0 - row['traffic_speed'] / 15.0))
+            edges_with_traffic += 1
+
+    # Summary statistics
+    print("\n" + "="*70)
+    print("EXTRACTION COMPLETE")
+    print("="*70)
+    print(f"Total edges with traffic: {edges_with_traffic:,}")
+    print(f"Total matches: {total_matched:,}")
+    
+    if edges_with_traffic > 0:
+        traffic_speeds = edges_gdf[edges_gdf['sample_count'] > 0]['traffic_speed']
+        congestion_levels = edges_gdf[edges_gdf['sample_count'] > 0]['congestion']
+        print(f"\nTraffic Statistics:")
+        print(f"  Speed (m/s):    min={traffic_speeds.min():.2f}, "
+              f"mean={traffic_speeds.mean():.2f}, max={traffic_speeds.max():.2f}")
+        print(f"  Congestion:     min={congestion_levels.min():.3f}, "
+              f"mean={congestion_levels.mean():.3f}, max={congestion_levels.max():.3f}")
+        print(f"  Sample counts:  min={edges_gdf['sample_count'].min():.0f}, "
+              f"mean={edges_gdf['sample_count'].mean():.1f}, "
+              f"max={edges_gdf['sample_count'].max():.0f}")
+    
+    print("="*70 + "\n")
+    
+    return edges_gdf
 
 def generate_traffic_heatmaps(city_dir, edges_gdf, num_snapshots=10):
     """Generate multiple zoomed-in traffic heatmap images using SPATIALLY MATCHED traffic data"""
@@ -938,6 +1400,46 @@ def generate_traffic_heatmaps(city_dir, edges_gdf, num_snapshots=10):
             print(f"  ⚠ No edges in zoom area for {area_name}")
     
     print(f"✓ Generated {images_created} traffic heatmap images using SPATIALLY MATCHED data")
+
+def rasterize_traffic(city_dir, edges, run_number=1, grid_size=32):
+    """
+    Convert traffic edge data into a raster grid and save as .npy
+    """
+    import numpy as np
+
+    # Use only edges with traffic data
+    traffic_edges = edges[edges['sample_count'] > 0]
+
+    if len(traffic_edges) == 0:
+        print("⚠ No traffic data available for rasterization")
+        return None
+
+    # Compute bounds
+    minx, miny, maxx, maxy = traffic_edges.total_bounds
+    x_range = maxx - minx
+    y_range = maxy - miny
+
+    raster = np.zeros((grid_size, grid_size), dtype=np.float32)
+
+    for idx, edge in traffic_edges.iterrows():
+        # Use midpoint of edge
+        coords = list(edge['geometry'].coords)
+        mid_x = (coords[0][0] + coords[-1][0]) / 2
+        mid_y = (coords[0][1] + coords[-1][1]) / 2
+
+        # Map to grid indices
+        i = int((mid_x - minx) / x_range * (grid_size - 1))
+        j = int((mid_y - miny) / y_range * (grid_size - 1))
+
+        # Use congestion as value
+        raster[j, i] = edge['congestion']
+
+    # Save raster with run number in filename
+    raster_file = os.path.join(city_dir, f"traffic_raster_run{run_number}.npy")
+    np.save(raster_file, raster)
+    print(f"✓ Saved raster for run {run_number}: {raster_file}")
+    return raster_file
+
     
     # Create one overview heatmap showing the whole city
     #create_city_overview_heatmap(city_dir, edges_gdf, traffic_data, sumo_edges, focus_points)
@@ -1057,6 +1559,11 @@ def main():
             
         city_safe = city["name"].replace(",", "").replace(" ", "_")
         city_dir = os.path.join(output_dir, city_safe)
+
+        edges = augment_edges_with_emergency_features(edges)
+        
+        # Save enhanced edges
+        edges.to_file(os.path.join(city_dir, "edges.geojson"), driver="GeoJSON")
         
         # Step 2: Run SUMO pipeline if available and enabled
         run_sumo = city.get("run_sumo", False) and sumo_available
@@ -1083,8 +1590,8 @@ def main():
                 print(f"✓ Loaded cached traffic data")
                 
             elif G is not None:
-                # Need to run full SUMO pipeline
-                print("Starting SUMO pipeline...")
+                # Run full SUMO pipeline with multiple runs
+                print("Starting IMPROVED SUMO pipeline...")
                 try:
                     # Save OSM file
                     osm_file = save_osm_for_sumo(G, city["name"])
@@ -1096,29 +1603,33 @@ def main():
                     if not sumo_net:
                         raise Exception("Failed to convert to SUMO network")
                     
-                    # Generate traffic demand
-                    routes_file = generate_traffic_demand(sumo_net, city_dir)
-                    if not routes_file:
-                        raise Exception("Failed to generate traffic demand")
+                    # Run multiple simulations
+                    for run_num in range(1, NUM_SIMULATION_RUNS + 1):
+                        print(f"\n--- Simulation Run {run_num}/{NUM_SIMULATION_RUNS} ---")
+                        
+                        routes_file = generate_traffic_demand_multiple_runs(
+                            sumo_net, city_dir, run_num
+                        )
+                        if not routes_file:
+                            continue
+                        
+                        routes_file = add_emergency_vehicles(routes_file, city_dir)
+                        
+                        edgedata_file = run_sumo_simulation_multiple(
+                            sumo_net, routes_file, city_dir, run_num
+                        )
+                        
+                        if not edgedata_file:
+                            print(f"Warning: Run {run_num} failed")
                     
-                    # Add emergency vehicles
-                    routes_file = add_emergency_vehicles(routes_file, city_dir)
+                    # Extract aggregated traffic data
+                    edges = extract_traffic_data_multi_run(city_dir, edges)
                     
-                    # Run simulation
-                    edgedata_file = run_sumo_simulation(sumo_net, routes_file, city_dir)
-                    if not edgedata_file:
-                        raise Exception("SUMO simulation failed")
-                    
-                    # Extract traffic data
-                    edges = extract_traffic_data(city_dir, edges)
-                    
-                    # Generate CNN training images
-                    generate_traffic_heatmaps(city_dir, edges, num_snapshots=NUM_TRAFFIC_SNAPSHOTS)
-                    
-                    # Save updated edges
-                    edges_with_traffic = os.path.join(city_dir, "edges_with_traffic.geojson")
-                    edges.to_file(edges_with_traffic, driver="GeoJSON")
-                    print(f"✓ Completed SUMO pipeline for {city['name']}")
+                    # Generate heatmaps
+                    #generate_traffic_heatmaps(city_dir, edges, num_snapshots=NUM_TRAFFIC_SNAPSHOTS)
+                    raster_file = rasterize_traffic(city_dir, edges, run_number=run_num)
+
+                    print(f"✓ Completed IMPROVED SUMO pipeline for {city['name']}")
                     
                 except Exception as e:
                     print(f"✗ SUMO pipeline failed: {e}")
@@ -1142,8 +1653,16 @@ def main():
             print(f"  - Edges with traffic data: {traffic_edges}")
     
     print(f"\n{'=' * 70}")
-    print("Data collection complete!")
-    print(f"Output directory: {os.path.abspath(output_dir)}")
+    print("IMPROVED data collection complete!")
+    print(f"{'=' * 70}")
+    print(f"\nDATA COLLECTION SUMMARY:")
+    print(f"  - Simulation runs: {NUM_SIMULATION_RUNS}")
+    print(f"  - Simulation time per run: {SIMULATION_TIME/60:.0f} minutes")
+    print(f"  - Expected images: {NUM_TRAFFIC_SNAPSHOTS * NUM_SIMULATION_RUNS}+")
+    print(f"  - Total simulated traffic time: {SIMULATION_TIME * NUM_SIMULATION_RUNS / 3600:.1f} hours")
+    print(f"\n✓ This data is now cached - you won't need to regenerate it!")
+    print(f"✓ Ready for training with {NUM_TRAFFIC_SNAPSHOTS * NUM_SIMULATION_RUNS}+ diverse traffic scenarios")
+    print(f"\nOutput directory: {os.path.abspath(output_dir)}")
     print(f"{'=' * 70}")
 
 if __name__ == "__main__":
