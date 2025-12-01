@@ -154,7 +154,6 @@ def load_sumo_geometries(sumo_net_file):
 
 def match_sumo_to_osm(sumo_id, sumo_edges, osm_edge_data, osm_idx, 
                       sumo_bounds, osm_bounds):
-    """Spatially match SUMO edge to OSM edge"""
     if sumo_id not in sumo_edges or len(sumo_edges[sumo_id]) < 2:
         return None
     
@@ -174,8 +173,8 @@ def match_sumo_to_osm(sumo_id, sumo_edges, osm_edge_data, osm_idx,
     osm_mid_x = osm_bounds[0] + norm_x * osm_width
     osm_mid_y = osm_bounds[1] + norm_y * osm_height
     
-    # Find nearby edges
-    search_radius = 0.001
+    # Increased search radius for better matching
+    search_radius = 0.003  # Increased from 0.001
     nearby = list(osm_idx.intersection((
         osm_mid_x - search_radius, osm_mid_y - search_radius,
         osm_mid_x + search_radius, osm_mid_y + search_radius
@@ -267,8 +266,12 @@ def create_edge_level_data(osm_edge_data, osm_idx, edges_gdf,
                 'is_restricted': osm_edge['is_restricted'],
                 'highway_type': highway_to_idx.get(osm_edge['highway'], 5),
                 
-                # SUMO traffic features
-                **traffic_data,
+                 # SELECTED traffic features for MLP INPUTS (different from target)
+                'traffic_flow': traffic_data['traffic_flow'],      # "flow" in XML
+                'travel_time': traffic_data['travel_time'],        # "traveltime" in XML  
+                'time_loss': traffic_data['time_loss'],            # "timeLoss" in XML
+                'waiting_time': traffic_data['waiting_time'],      # "waitingTime" in XML
+                # We are NOT including: speed, density, occupancy (used in target)
                 
                 # Target
                 'target': calculate_emergency_suitability(traffic_data, osm_edge)
@@ -283,19 +286,23 @@ def create_edge_level_data(osm_edge_data, osm_idx, edges_gdf,
     return edge_samples
 
 def calculate_emergency_suitability(traffic_data, osm_edge):
-    """Calculate emergency vehicle suitability score"""
+    """Enhanced emergency vehicle suitability score - focused on clearance"""
     speed = traffic_data.get('traffic_speed', 0)
     density = traffic_data.get('traffic_density', 0)
-    occupancy = traffic_data.get('traffic_occupancy', 0)
+    flow = traffic_data.get('traffic_flow', 0)
     
-    speed_score = min(speed / 15.0, 1.0) * 0.3
-    density_score = max(0, 1.0 - (density / 50.0)) * 0.2
-    occupancy_score = max(0, 1.0 - occupancy) * 0.1
-    traffic_score = speed_score + density_score + occupancy_score
+    # Emergency vehicles prioritize clear paths over speed
+    if density > 0 or flow > 0:  # Has actual traffic
+        clearance_score = max(0, 1.0 - (density / 40.0)) * 0.5  # Higher weight for clearance
+        speed_score = min(speed / 25.0, 1.0) * 0.3  # Higher speed threshold for emergencies
+        road_quality = osm_edge['emergency_score'] * 0.2
+    else:
+        # No traffic - perfect for emergencies
+        clearance_score = 1.0 * 0.5
+        speed_score = 1.0 * 0.3  
+        road_quality = osm_edge['emergency_score'] * 0.2
     
-    road_score = osm_edge['emergency_score'] * 0.4
-    
-    return min(1.0, max(0.0, traffic_score + road_score))
+    return min(1.0, max(0.0, clearance_score + speed_score + road_quality))
 
 # ============================================
 # STEP 5: Aggregate to Node-Level Features (GNN)
@@ -320,32 +327,32 @@ def create_node_level_data(edge_samples, nodes_gdf):
     for run_num, run_edges in edges_by_run.items():
         print(f"  Run {run_num}...")
         
-        # Aggregate features per node
+        # Aggregate features per node - USE THE FEATURES WE ACTUALLY HAVE
         node_features = defaultdict(lambda: {
-            'speeds': [],
-            'densities': [],
             'flows': [],
-            'occupancies': [],
+            'travel_times': [],
+            'time_losses': [],
+            'waiting_times': [],
             'emergency_scores': [],
             'lanes': [],
             'connected_edges': 0
         })
         
-        # Aggregate from edges
+        # Aggregate from edges - USE THE FEATURES WE ACTUALLY HAVE
         for edge in run_edges:
             u, v = edge['osm_u'], edge['osm_v']
             
             # Add to both source and target nodes
             for node_id in [u, v]:
-                node_features[node_id]['speeds'].append(edge['traffic_speed'])
-                node_features[node_id]['densities'].append(edge['traffic_density'])
                 node_features[node_id]['flows'].append(edge['traffic_flow'])
-                node_features[node_id]['occupancies'].append(edge['traffic_occupancy'])
+                node_features[node_id]['travel_times'].append(edge['travel_time'])
+                node_features[node_id]['time_losses'].append(edge['time_loss'])
+                node_features[node_id]['waiting_times'].append(edge['waiting_time'])
                 node_features[node_id]['emergency_scores'].append(edge['emergency_score'])
                 node_features[node_id]['lanes'].append(edge['lanes'])
                 node_features[node_id]['connected_edges'] += 1
         
-        # Convert to node samples
+        # Convert to node samples - UPDATE METRICS TO MATCH OUR FEATURES
         node_samples = []
         for node_id, features in node_features.items():
             if features['connected_edges'] == 0:
@@ -355,26 +362,26 @@ def create_node_level_data(edge_samples, nodes_gdf):
                 'run': run_num,
                 'node_id': node_id,
                 
-                # Aggregated traffic features
-                'avg_speed': np.mean(features['speeds']),
-                'max_speed': np.max(features['speeds']),
-                'min_speed': np.min(features['speeds']),
-                
-                'avg_density': np.mean(features['densities']),
-                'max_density': np.max(features['densities']),
-                
-                'total_flow': np.sum(features['flows']),
+                # Aggregated traffic features - USE WHAT WE HAVE
                 'avg_flow': np.mean(features['flows']),
+                'max_flow': np.max(features['flows']),
+                'min_flow': np.min(features['flows']),
                 
-                'avg_occupancy': np.mean(features['occupancies']),
+                'avg_travel_time': np.mean(features['travel_times']),
+                'max_travel_time': np.max(features['travel_times']),
+                
+                'avg_time_loss': np.mean(features['time_losses']),
+                'max_time_loss': np.max(features['time_losses']),
+                
+                'avg_waiting_time': np.mean(features['waiting_times']),
                 
                 # Road network features
                 'avg_emergency_score': np.mean(features['emergency_scores']),
                 'avg_lanes': np.mean(features['lanes']),
                 'degree': features['connected_edges'],
                 
-                # Node congestion indicator
-                'is_congested': 1 if np.mean(features['speeds']) < 5.0 else 0,
+                # Node congestion indicator - USE TRAVEL TIME INSTEAD OF SPEED
+                'is_congested': 1 if np.mean(features['travel_times']) > 30.0 else 0,
             }
             
             node_samples.append(sample)
@@ -443,23 +450,74 @@ def create_adjacency_matrix(edges_gdf, nodes_gdf, edge_samples):
     return adjacency_data
 
 # ============================================
-# STEP 7: Save All Data
+# STEP 7: Save All Data (NO LEAKAGE VERSION)
 # ============================================
 def save_all_data(edge_samples, node_samples, adjacency_data):
-    """Save all prepared data"""
-    print("\n[6/6] Saving all data...")
+    """Save all prepared data with proper edge-based splitting"""
+    print("\n[6/6] Saving all data (with leakage prevention)...")
     
-    # Split edge-level data (MLP)
+    # ===== SPLIT BY UNIQUE EDGES (NOT SAMPLES) =====
+    print("\n  Creating train/val/test split by unique edges...")
+    
+    # Group samples by edge
+    edges_to_samples = defaultdict(list)
+    for sample in edge_samples:
+        edge_key = (sample['osm_u'], sample['osm_v'])
+        edges_to_samples[edge_key].append(sample)
+    
+    # Split EDGES (not samples)
+    unique_edges = list(edges_to_samples.keys())
     np.random.seed(42)
-    np.random.shuffle(edge_samples)
+    np.random.shuffle(unique_edges)
     
-    n = len(edge_samples)
-    train_end = int(n * 0.7)
-    val_end = int(n * 0.85)
+    n_edges = len(unique_edges)
+    train_edge_end = int(n_edges * 0.7)
+    val_edge_end = int(n_edges * 0.85)
     
-    edge_train = edge_samples[:train_end]
-    edge_val = edge_samples[train_end:val_end]
-    edge_test = edge_samples[val_end:]
+    train_edges = set(unique_edges[:train_edge_end])
+    val_edges = set(unique_edges[train_edge_end:val_edge_end])
+    test_edges = set(unique_edges[val_edge_end:])
+    
+    # Assign samples based on which edge they belong to
+    edge_train = []
+    edge_val = []
+    edge_test = []
+    
+    for edge_key, edge_samples_list in edges_to_samples.items():
+        if edge_key in train_edges:
+            edge_train.extend(edge_samples_list)
+        elif edge_key in val_edges:
+            edge_val.extend(edge_samples_list)
+        else:
+            edge_test.extend(edge_samples_list)
+    
+    print(f"  Edges split:")
+    print(f"    Train edges: {len(train_edges)}")
+    print(f"    Val edges:   {len(val_edges)}")
+    print(f"    Test edges:  {len(test_edges)}")
+    print(f"  Sample split:")
+    print(f"    Train: {len(edge_train)} samples")
+    print(f"    Val:   {len(edge_val)} samples")
+    print(f"    Test:  {len(edge_test)} samples")
+    
+    # Verify no leakage
+    train_edge_set = set((s['osm_u'], s['osm_v']) for s in edge_train)
+    val_edge_set = set((s['osm_u'], s['osm_v']) for s in edge_val)
+    test_edge_set = set((s['osm_u'], s['osm_v']) for s in edge_test)
+    
+    overlap_train_val = train_edge_set & val_edge_set
+    overlap_train_test = train_edge_set & test_edge_set
+    overlap_val_test = val_edge_set & test_edge_set
+    
+    print(f"\n  ✓ Leakage check:")
+    print(f"    Train-Val overlap:  {len(overlap_train_val)} edges")
+    print(f"    Train-Test overlap: {len(overlap_train_test)} edges")
+    print(f"    Val-Test overlap:   {len(overlap_val_test)} edges")
+    
+    if len(overlap_train_val) > 0 or len(overlap_train_test) > 0 or len(overlap_val_test) > 0:
+        print("    ⚠ WARNING: Data leakage detected!")
+    else:
+        print("    ✓ No data leakage - splits are clean!")
     
     # Save edge-level (MLP) data
     with open(os.path.join(OUTPUT_DIR, "mlp_train.pkl"), 'wb') as f:
@@ -471,10 +529,10 @@ def save_all_data(edge_samples, node_samples, adjacency_data):
     
     pd.DataFrame(edge_train).to_csv(os.path.join(OUTPUT_DIR, "mlp_train.csv"), index=False)
     
-    print(f"  MLP data:")
-    print(f"    Train: {len(edge_train)}")
-    print(f"    Val:   {len(edge_val)}")
-    print(f"    Test:  {len(edge_test)}")
+    print(f"\n  MLP data saved:")
+    print(f"    Train: {len(edge_train)} samples")
+    print(f"    Val:   {len(edge_val)} samples")
+    print(f"    Test:  {len(edge_test)} samples")
     
     # Save node-level (GNN) data
     with open(os.path.join(OUTPUT_DIR, "gnn_node_features.pkl"), 'wb') as f:
@@ -502,6 +560,62 @@ def save_all_data(edge_samples, node_samples, adjacency_data):
     }, os.path.join(OUTPUT_DIR, "graph_structure.pt"))
     
     print(f"  ✓ Saved PyTorch graph structure")
+
+def check_unique_edge_coverage(edge_samples):
+    """Check how many unique edges we have data for"""
+    print("\n[DIAGNOSTIC] Unique Edge Analysis:")
+    
+    unique_edges = set()
+    for sample in edge_samples:
+        edge_key = (sample['osm_u'], sample['osm_v'])
+        unique_edges.add(edge_key)
+    
+    print(f"  Total samples: {len(edge_samples)}")
+    print(f"  Unique edges: {len(unique_edges)}")
+    print(f"  Average samples per edge: {len(edge_samples) / len(unique_edges):.1f}")
+    
+    # Check distribution across runs
+    samples_by_run = {}
+    for sample in edge_samples:
+        run = sample['run']
+        samples_by_run[run] = samples_by_run.get(run, 0) + 1
+    
+    print("  Samples per run:")
+    for run, count in sorted(samples_by_run.items()):
+        print(f"    Run {run}: {count} samples")
+
+
+def filter_meaningful_traffic_data(edge_samples):
+    """Filter to keep only samples with meaningful traffic data"""
+    print("\n[FILTERING] Removing zero-traffic samples...")
+    
+    meaningful_samples = []
+    traffic_stats = {
+        'has_traffic': 0,
+        'no_traffic': 0,
+        'total': len(edge_samples)
+    }
+    
+    for sample in edge_samples:
+        # Use the traffic features we actually have: traffic_flow, travel_time, time_loss
+        has_meaningful_traffic = (
+            sample['traffic_flow'] > 1.0 or
+            sample['travel_time'] > 0.1 or
+            sample['time_loss'] > 0.1
+        )
+        
+        if has_meaningful_traffic:
+            meaningful_samples.append(sample)
+            traffic_stats['has_traffic'] += 1
+        else:
+            traffic_stats['no_traffic'] += 1
+    
+    print(f"  Before filtering: {traffic_stats['total']} samples")
+    print(f"  With meaningful traffic: {traffic_stats['has_traffic']} samples")
+    print(f"  Without meaningful traffic: {traffic_stats['no_traffic']} samples")
+    print(f"  Kept {len(meaningful_samples)}/{len(edge_samples)} samples ({len(meaningful_samples)/len(edge_samples)*100:.1f}%)")
+    
+    return meaningful_samples
 
 # ============================================
 # MAIN
@@ -531,10 +645,16 @@ def main():
     edge_samples = create_edge_level_data(
         osm_edge_data, osm_idx, edges_gdf, traffic_features_all_runs
     )
+
+    print("\n[3.5/6] Filtering for meaningful traffic data...")
+    edge_samples = filter_meaningful_traffic_data(edge_samples)
     
     if not edge_samples:
         print("✗ No edge samples created!")
         return
+    
+    #-------diagnostic check-------#
+    check_unique_edge_coverage(edge_samples)
     
     # Step 4: Create node-level data (GNN)
     node_samples = create_node_level_data(edge_samples, nodes_gdf)

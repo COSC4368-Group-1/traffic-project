@@ -42,16 +42,16 @@ def generate_trips(sumo_tools_path, net_file, trips_file, density=3, seed=42):
 # Config - ENABLED ALL CITIES FOR SUMO
 # -----------------------------
 cities = [
-    #{"name": "New York, NY, USA", "zoom": 17, "sample_nodes": 5, "run_sumo": False},  # ENABLED
+    #{"name": "New York, NY, USA", "zoom": 17, "sample_nodes": 5, "run_sumo": False},  # disabled
     {"name": "Houston, TX, USA", "zoom": 17, "sample_nodes": 5, "run_sumo": True}
-    #{"name": "Los Angeles, CA, USA", "zoom": 17, "sample_nodes": 5, "run_sumo": False},  # ENABLED
+    #{"name": "Los Angeles, CA, USA", "zoom": 17, "sample_nodes": 5, "run_sumo": False},  # Disabled
 ]
 
 output_dir = "raw_data"
 os.makedirs(output_dir, exist_ok=True)
 
 # SUMO configuration
-SIMULATION_TIME = 2400  # 40 minutes for testing
+SIMULATION_TIME = 7200  # 120 minutes for testing
 NUM_TRAFFIC_SNAPSHOTS = 40  # Number of traffic data snapshots to extract
 NUM_SIMULATION_RUNS = 5  # Number of simulation runs per city
 
@@ -467,7 +467,7 @@ def convert_to_sumo_network(osm_file, city_dir):
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900)
         print(f"✓ Created SUMO network: {sumo_net}")
         return sumo_net
     except subprocess.CalledProcessError as e:
@@ -539,7 +539,7 @@ def generate_traffic_demand_multiple_runs(sumo_net, city_dir, run_number=1):
         
         # Read output with timeout
         try:
-            stdout, stderr = process.communicate(timeout=1200)  # 20 minute timeout
+            stdout, stderr = process.communicate(timeout=3600)  # 60 minute timeout
             
             if process.returncode == 0:
                 print(f"✓ Generated trips for run {run_number}")
@@ -571,7 +571,7 @@ def generate_traffic_demand_multiple_runs(sumo_net, city_dir, run_number=1):
     ]
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
         print(f"✓ Generated routes for run {run_number}")
         return routes_file
     except subprocess.TimeoutExpired:
